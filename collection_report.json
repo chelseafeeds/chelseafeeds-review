@@ -1,0 +1,110 @@
+{
+  "collector_version": "3.4",
+  "run_started_at": "2026-11-11T02:08:30.268029+00:00",
+  "run_completed_at": "2026-11-11T02:09:17.154123+00:00",
+  "configured_sources": 10,
+  "successful_sources": 10,
+  "failed_sources": 0,
+  "total_collected": 211,
+  "unique_stories": 175,
+  "new_stories": 175,
+  "selected_stories": 50,
+  "unresolved_article_urls": 26,
+  "source_reports": [
+    {
+      "source": "BBC Sport",
+      "url": "https://feeds.bbci.co.uk/sport/football/rss.xml",
+      "status": "success",
+      "entries_received": 84,
+      "stories_collected": 2,
+      "rejected_old": 16,
+      "error": null
+    },
+    {
+      "source": "Sky Sports",
+      "url": "https://www.skysports.com/rss/12040",
+      "status": "success",
+      "entries_received": 20,
+      "stories_collected": 2,
+      "rejected_old": 0,
+      "error": null
+    },
+    {
+      "source": "Google News Chelsea",
+      "url": "https://news.google.com/rss/search?q=Chelsea+FC+when:7d&hl=en-GB&gl=GB&ceid=GB:en",
+      "status": "success",
+      "entries_received": 100,
+      "stories_collected": 97,
+      "rejected_old": 0,
+      "error": null
+    },
+    {
+      "source": "The Guardian",
+      "url": "https://www.theguardian.com/football/chelsea/rss",
+      "status": "success",
+      "entries_received": 20,
+      "stories_collected": 3,
+      "rejected_old": 16,
+      "error": null
+    },
+    {
+      "source": "TalkChelsea",
+      "url": "https://www.talkchelsea.net/feed/",
+      "status": "success",
+      "entries_received": 10,
+      "stories_collected": 10,
+      "rejected_old": 0,
+      "error": null
+    },
+    {
+      "source": "Chelsea.news",
+      "url": "https://chelsea.news/feed",
+      "status": "success",
+      "entries_received": 10,
+      "stories_collected": 7,
+      "rejected_old": 3,
+      "error": null
+    },
+    {
+      "source": "Chelsea FC Latest News",
+      "url": "https://chelseafclatestnews.com/feed",
+      "status": "success",
+      "entries_received": 10,
+      "stories_collected": 4,
+      "rejected_old": 6,
+      "error": null
+    },
+    {
+      "source": "Football365",
+      "url": "https://www.football365.com/rss",
+      "status": "success",
+      "entries_received": 44,
+      "stories_collected": 3,
+      "rejected_old": 0,
+      "error": null
+    },
+    {
+      "source": "Official Chelsea News Search",
+      "url": "https://news.google.com/rss/search?q=site%3Achelseafc.com%2Fen%2Fnews&hl=en-GB&gl=GB&ceid=GB:en",
+      "status": "success",
+      "entries_received": 100,
+      "stories_collected": 32,
+      "rejected_old": 68,
+      "error": null
+    },
+    {
+      "source": "NewsNow",
+      "url": "https://www.newsnow.com/us/?search=Chelsea",
+      "status": "success",
+      "entries_received": 51,
+      "stories_collected": 51,
+      "error": null
+    }
+  ],
+  "notes": [
+    "Collected items are candidates, not independently verified facts.",
+    "Multiple publisher labels do not prove independent corroboration.",
+    "Aggregator URLs remain unresolved unless a redirect or canonical URL identifies the publisher article.",
+    "No article generation or Blogger/X publishing is performed by this collector."
+  ]
+}
