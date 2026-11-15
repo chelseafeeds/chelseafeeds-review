@@ -270,7 +270,7 @@ function findRelatedDownstreamRuns(downstreamRuns, upstreamRun) {
   // head_sha is deliberately not used: workflow_run executions may have a
   // different head_sha from the upstream run that triggered them.
   const marker = new RegExp(
-    String.raw`(?:^|\\s)source[=:]\\s*${String(upstreamRun.id)}(?:\\s|$)`,
+    String.raw`(?:^|\s)source[=:]\s*${String(upstreamRun.id)}(?:\s|$)`,
     "i"
   );
 
