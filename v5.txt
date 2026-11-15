@@ -1,0 +1,795 @@
+
+const VERSION = "chelseafeeds-heartbeat-v5-2026-11-15";
+const REPO = "chelseafeeds/chelseafeeds-automation";
+const BRANCH = "main";
+const API = "https://api.github.com";
+
+const ACTIVE_STATES = [
+  "queued",
+  "in_progress",
+  "waiting",
+  "pending",
+  "requested"
+];
+
+const WORKFLOWS = [
+  {
+    file: "collect-news.yml",
+    name: "Chelsea News Collection",
+    staleMinutes: 20,
+    cooldownMinutes: 15
+  },
+  {
+    file: "monitor-processing.yml",
+    name: "ChelseaFeeds Watchdog and Processing Monitor",
+    staleMinutes: 30,
+    cooldownMinutes: 30
+  }
+];
+
+const STAGES = [
+  {
+    file: "process-news.yml",
+    name: "ChelseaFeeds Evidence and Article Drafts",
+    upstreamFile: "collect-news.yml",
+    upstreamName: "Chelsea News Collection",
+    artifactName: "chelsea-news-candidates",
+    graceMinutes: 15
+  },
+  {
+    file: "auto-schedule-editorial-batch.yml",
+    name: "ChelseaFeeds Auto Schedule Editorial Batch",
+    upstreamFile: "process-news.yml",
+    upstreamName: "ChelseaFeeds Evidence and Article Drafts",
+    artifactName: "chelseafeeds-editorial-results",
+    graceMinutes: 15
+  }
+];
+
+// --------------------------------------------------
+// GITHUB API
+// --------------------------------------------------
+
+async function github(path, env, options = {}) {
+  if (!env.GITHUB_TOKEN) {
+    throw new Error("GITHUB_TOKEN secret is missing");
+  }
+
+  const response = await fetch(`${API}${path}`, {
+    ...options,
+    headers: {
+      Authorization: `Bearer ${env.GITHUB_TOKEN}`,
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      "User-Agent": "ChelseaFeeds-External-Heartbeat",
+      ...(options.headers || {})
+    }
+  });
+
+  const body = await response.text();
+
+  if (!response.ok) {
+    throw new Error(
+      `GitHub API ${response.status}: ${body.slice(0, 500)}`
+    );
+  }
+
+  return body ? JSON.parse(body) : {};
+}
+
+// --------------------------------------------------
+// TIMESTAMP DETECTION
+// --------------------------------------------------
+
+function parseTimestamp(value) {
+  if (!value) return null;
+
+  const result = Date.parse(value);
+
+  return Number.isFinite(result) && result > 0
+    ? result
+    : null;
+}
+
+function getRunTimestamp(run) {
+  if (!run) return null;
+
+  const candidates = [
+    ["completed_at", run.completed_at],
+    ["updated_at", run.updated_at],
+    ["run_started_at", run.run_started_at],
+    ["created_at", run.created_at]
+  ];
+
+  for (const [field, value] of candidates) {
+    const milliseconds = parseTimestamp(value);
+
+    if (milliseconds !== null) {
+      return {
+        value,
+        milliseconds,
+        field
+      };
+    }
+  }
+
+  return null;
+}
+
+function runAgeMinutes(run) {
+  const timestamp = getRunTimestamp(run);
+
+  if (!timestamp) return null;
+
+  return Math.max(
+    0,
+    Math.floor((Date.now() - timestamp.milliseconds) / 60000)
+  );
+}
+
+// --------------------------------------------------
+// WORKFLOW RUNS
+// --------------------------------------------------
+
+async function getWorkflowRuns(file, env) {
+  const data = await github(
+    `/repos/${REPO}/actions/workflows/${file}/runs?branch=${BRANCH}&per_page=100`,
+    env
+  );
+
+  if (!Array.isArray(data.workflow_runs)) {
+    throw new Error(`Invalid workflow-run response for ${file}`);
+  }
+
+  return data.workflow_runs;
+}
+
+function sortNewest(runs) {
+  return [...runs].sort((a, b) => {
+    const ta = getRunTimestamp(a)?.milliseconds || 0;
+    const tb = getRunTimestamp(b)?.milliseconds || 0;
+    return tb - ta;
+  });
+}
+
+function isActive(run) {
+  return ACTIVE_STATES.includes(run.status);
+}
+
+function isSuccessful(run) {
+  return run.status === "completed" &&
+    run.conclusion === "success";
+}
+
+// --------------------------------------------------
+// BASIC WORKFLOW HEALTH
+// --------------------------------------------------
+
+async function inspectWorkflow(workflow, env) {
+  const runs = sortNewest(
+    await getWorkflowRuns(workflow.file, env)
+  );
+
+  const active = runs.filter(isActive);
+  const successful = runs.filter(isSuccessful);
+  const latestSuccess = successful[0] || null;
+
+  const timestamp = getRunTimestamp(latestSuccess);
+
+  const ageMinutes = timestamp
+    ? Math.max(
+        0,
+        Math.floor(
+          (Date.now() - timestamp.milliseconds) / 60000
+        )
+      )
+    : null;
+
+  const stale = timestamp
+    ? ageMinutes > workflow.staleMinutes
+    : runs.length === 0;
+
+  return {
+    workflow: workflow.name,
+    file: workflow.file,
+    totalRuns: runs.length,
+    activeRuns: active.length,
+    successfulRuns: successful.length,
+    latestSuccessfulRun: latestSuccess?.id || null,
+    lastSuccessfulCompletion: timestamp?.value || null,
+    timestampSource: timestamp?.field || null,
+    timestampStatus: timestamp ? "detected" :
+      latestSuccess ? "timestamp_unavailable" :
+      runs.length === 0 ? "no_previous_runs" :
+      "no_successful_run",
+    ageMinutes,
+    stale
+  };
+}
+
+// --------------------------------------------------
+// ARTIFACT VALIDATION
+// --------------------------------------------------
+
+async function getRequiredArtifact(runId, artifactName, env) {
+  const data = await github(
+    `/repos/${REPO}/actions/runs/${runId}/artifacts?per_page=100`,
+    env
+  );
+
+  const artifact = (data.artifacts || []).find(
+    item => item.name === artifactName
+  );
+
+  if (!artifact) {
+    return {
+      available: false,
+      reason: `Required artifact ${artifactName} not found`
+    };
+  }
+
+  if (artifact.expired) {
+    return {
+      available: false,
+      reason: `Required artifact ${artifactName} has expired`
+    };
+  }
+
+  if (!artifact.id || !artifact.archive_download_url) {
+    return {
+      available: false,
+      reason: "Artifact metadata is incomplete"
+    };
+  }
+
+  return {
+    available: true,
+    artifactId: artifact.id,
+    artifactName: artifact.name,
+    expiresAt: artifact.expires_at || null
+  };
+}
+
+// --------------------------------------------------
+// DOWNSTREAM CORRELATION
+// --------------------------------------------------
+
+function findRelatedDownstreamRuns(downstreamRuns, upstreamRun) {
+  const upstreamTimestamp = getRunTimestamp(upstreamRun);
+
+  if (!upstreamTimestamp || !upstreamRun.id) {
+    return {
+      identifiable: false,
+      exactMatch: null,
+      ambiguousRuns: [],
+      reason: "Upstream run ID or timestamp is unavailable"
+    };
+  }
+
+  // Match the exact upstream ID embedded in the downstream workflow run title.
+  // head_sha is deliberately not used: workflow_run executions may have a
+  // different head_sha from the upstream run that triggered them.
+  const marker = new RegExp(
+    String.raw`(?:^|\\s)source[=:]\\s*${String(upstreamRun.id)}(?:\\s|$)`,
+    "i"
+  );
+
+  const eligible = downstreamRuns.filter(run =>
+    ["workflow_run", "workflow_dispatch"].includes(run.event)
+  );
+
+  const exactMatches = eligible.filter(run => {
+    const title = [run.display_title || "", run.name || ""].join(" ");
+    return marker.test(title);
+  });
+
+  if (exactMatches.length > 0) {
+    return {
+      identifiable: true,
+      exactMatch: sortNewest(exactMatches)[0],
+      ambiguousRuns: [],
+      reason: "Exact upstream source ID found in downstream run title"
+    };
+  }
+
+  // Fail closed if a downstream run appeared after this upstream run but
+  // lacks a verifiable source marker. It may already be the normal trigger.
+  const earliest = upstreamTimestamp.milliseconds - 3 * 60000;
+  const ambiguousRuns = eligible.filter(run => {
+    const created = parseTimestamp(run.created_at);
+    return created !== null && created >= earliest;
+  });
+
+  return {
+    identifiable: ambiguousRuns.length === 0,
+    exactMatch: null,
+    ambiguousRuns: sortNewest(ambiguousRuns),
+    reason: ambiguousRuns.length > 0
+      ? "A downstream run exists without a verifiable exact source marker; recovery withheld"
+      : "No downstream run found for this upstream source"
+  };
+}
+
+// --------------------------------------------------
+// SAFE DISPATCH
+// --------------------------------------------------
+
+async function dispatchStage(stage, sourceRun, env) {
+  const key =
+    `dispatch:v5:${stage.file}:${sourceRun.id}`;
+
+  const existing = await env.HEARTBEAT_KV.get(key);
+
+  if (existing) {
+    return {
+      dispatched: false,
+      reason: "This exact upstream run already has a dispatch record",
+      sourceRunId: sourceRun.id
+    };
+  }
+
+  // Check upstream artifact immediately before dispatch.
+  const artifact = await getRequiredArtifact(
+    sourceRun.id,
+    stage.artifactName,
+    env
+  );
+
+  if (!artifact.available) {
+    return {
+      dispatched: false,
+      reason: artifact.reason,
+      sourceRunId: sourceRun.id
+    };
+  }
+
+  // Check for a downstream run that may already have been triggered.
+  const downstreamRuns = await getWorkflowRuns(stage.file, env);
+
+  const correlation = findRelatedDownstreamRuns(
+    downstreamRuns,
+    sourceRun
+  );
+
+  if (!correlation.identifiable) {
+    return {
+      dispatched: false,
+      reason: "Cannot safely correlate upstream and downstream runs",
+      sourceRunId: sourceRun.id
+    };
+  }
+
+  if (correlation.exactMatch) {
+    const existing = correlation.exactMatch;
+
+    return {
+      workflow: stage.name,
+      file: stage.file,
+      sourceRunId: sourceRun.id,
+      correlation: "exact_source_id",
+      existingDownstreamRunId: existing.id,
+      existingDownstreamStatus: existing.status,
+      existingDownstreamConclusion: existing.conclusion || null,
+      dispatched: false,
+      reason: existing.conclusion === "success"
+        ? "Downstream processing already succeeded for this exact source run"
+        : "A downstream attempt already exists for this exact source run; duplicate recovery withheld"
+    };
+  }
+
+  if (correlation.ambiguousRuns.length > 0) {
+    const ambiguous = correlation.ambiguousRuns[0];
+
+    return {
+      workflow: stage.name,
+      file: stage.file,
+      sourceRunId: sourceRun.id,
+      correlation: "ambiguous_fail_closed",
+      ambiguousDownstreamRunId: ambiguous.id,
+      ambiguousDownstreamTitle: ambiguous.display_title || ambiguous.name || null,
+      dispatched: false,
+      reason: correlation.reason
+    };
+  }
+
+  // Recheck active runs to avoid overlapping executions.
+  const latestRuns = await getWorkflowRuns(stage.file, env);
+
+  const active = latestRuns.filter(isActive);
+
+  if (active.length > 0) {
+    return {
+      dispatched: false,
+      reason: "Another downstream run is active",
+      sourceRunId: sourceRun.id
+    };
+  }
+
+  // Reserve this exact upstream ID before dispatch.
+  // The key expires after seven days.
+  await env.HEARTBEAT_KV.put(
+    key,
+    JSON.stringify({
+      sourceRunId: sourceRun.id,
+      reservedAt: new Date().toISOString(),
+      workflow: stage.file
+    }),
+    { expirationTtl: 604800 }
+  );
+
+  try {
+    await github(
+      `/repos/${REPO}/actions/workflows/${stage.file}/dispatches`,
+      env,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          ref: BRANCH,
+          inputs: {
+            source_run_id: String(sourceRun.id),
+            recovery_approved: "true"
+          }
+        })
+      }
+    );
+
+    return {
+      dispatched: true,
+      reason: "GitHub accepted dispatch for the exact upstream run",
+      sourceRunId: sourceRun.id,
+      artifactName: artifact.artifactName,
+      artifactId: artifact.artifactId
+    };
+
+  } catch (error) {
+    // Keep the reservation if the outcome is uncertain. GitHub may have
+    // accepted the request even if the response was interrupted.
+    // Failing closed prevents a second dispatch for the same source run.
+    throw error;
+  }
+}
+
+// --------------------------------------------------
+// PROCESSOR AND SCHEDULER RECOVERY
+// --------------------------------------------------
+
+async function inspectStage(stage, env) {
+  const upstreamRuns = sortNewest(
+    await getWorkflowRuns(stage.upstreamFile, env)
+  );
+
+  const sourceRun = upstreamRuns.find(run =>
+    isSuccessful(run) &&
+    run.head_branch === BRANCH
+  );
+
+  if (!sourceRun) {
+    return {
+      workflow: stage.name,
+      file: stage.file,
+      dispatched: false,
+      reason: "No successful main-branch upstream run found"
+    };
+  }
+
+  const sourceTimestamp = getRunTimestamp(sourceRun);
+
+  if (!sourceTimestamp) {
+    return {
+      workflow: stage.name,
+      file: stage.file,
+      dispatched: false,
+      sourceRunId: sourceRun.id,
+      reason: "Upstream timestamp unavailable; recovery withheld"
+    };
+  }
+
+  const sourceAge = Math.max(
+    0,
+    Math.floor(
+      (Date.now() - sourceTimestamp.milliseconds) / 60000
+    )
+  );
+
+  const stageRuns = await getWorkflowRuns(stage.file, env);
+  const active = stageRuns.filter(isActive);
+
+  if (active.length > 0) {
+    return {
+      workflow: stage.name,
+      file: stage.file,
+      sourceRunId: sourceRun.id,
+      sourceAgeMinutes: sourceAge,
+      activeRuns: active.length,
+      dispatched: false,
+      reason: "A downstream run is already active"
+    };
+  }
+
+  if (sourceAge < stage.graceMinutes) {
+    return {
+      workflow: stage.name,
+      file: stage.file,
+      sourceRunId: sourceRun.id,
+      sourceAgeMinutes: sourceAge,
+      dispatched: false,
+      reason: "Waiting for normal GitHub workflow_run trigger"
+    };
+  }
+
+  const correlation = findRelatedDownstreamRuns(
+    stageRuns,
+    sourceRun
+  );
+
+  if (!correlation.identifiable) {
+    return {
+      workflow: stage.name,
+      file: stage.file,
+      sourceRunId: sourceRun.id,
+      dispatched: false,
+      reason: "Unable to correlate downstream run safely"
+    };
+  }
+
+  if (correlation.exactMatch) {
+    const existing = correlation.exactMatch;
+
+    return {
+      workflow: stage.name,
+      file: stage.file,
+      sourceRunId: sourceRun.id,
+      correlation: "exact_source_id",
+      existingDownstreamRunId: existing.id,
+      existingDownstreamStatus: existing.status,
+      existingDownstreamConclusion: existing.conclusion || null,
+      dispatched: false,
+      reason: existing.conclusion === "success"
+        ? "Downstream processing already succeeded for this exact source run"
+        : "A downstream attempt already exists for this exact source run; duplicate recovery withheld"
+    };
+  }
+
+  if (correlation.ambiguousRuns.length > 0) {
+    const ambiguous = correlation.ambiguousRuns[0];
+
+    return {
+      workflow: stage.name,
+      file: stage.file,
+      sourceRunId: sourceRun.id,
+      correlation: "ambiguous_fail_closed",
+      ambiguousDownstreamRunId: ambiguous.id,
+      ambiguousDownstreamTitle: ambiguous.display_title || ambiguous.name || null,
+      dispatched: false,
+      reason: correlation.reason
+    };
+  }
+
+  const artifact = await getRequiredArtifact(
+    sourceRun.id,
+    stage.artifactName,
+    env
+  );
+
+  if (!artifact.available) {
+    return {
+      workflow: stage.name,
+      file: stage.file,
+      sourceRunId: sourceRun.id,
+      dispatched: false,
+      reason: artifact.reason
+    };
+  }
+
+  const action = await dispatchStage(stage, sourceRun, env);
+
+  return {
+    workflow: stage.name,
+    file: stage.file,
+    sourceRunId: sourceRun.id,
+    sourceAgeMinutes: sourceAge,
+    artifactName: artifact.artifactName,
+    ...action
+  };
+}
+
+// --------------------------------------------------
+// COLLECTOR AND MONITOR RECOVERY
+// --------------------------------------------------
+
+async function dispatchBasicWorkflow(workflow, env) {
+  const key = `dispatch:v5:basic:${workflow.file}`;
+
+  const previous = await env.HEARTBEAT_KV.get(key);
+
+  if (previous) {
+    const elapsed =
+      (Date.now() - Number(previous)) / 60000;
+
+    if (elapsed < workflow.cooldownMinutes) {
+      return {
+        dispatched: false,
+        reason: "Cooldown active"
+      };
+    }
+  }
+
+  const runs = await getWorkflowRuns(workflow.file, env);
+
+  if (runs.some(isActive)) {
+    return {
+      dispatched: false,
+      reason: "Active run already exists"
+    };
+  }
+
+  const status = await inspectWorkflow(workflow, env);
+
+  if (!status.stale) {
+    return {
+      dispatched: false,
+      reason: "Recent successful run detected"
+    };
+  }
+
+  if (
+    status.timestampStatus === "timestamp_unavailable" ||
+    status.timestampStatus === "no_successful_run" &&
+    status.totalRuns > 0
+  ) {
+    return {
+      dispatched: false,
+      reason: "No reliable successful-run timestamp; recovery withheld"
+    };
+  }
+
+  await github(
+    `/repos/${REPO}/actions/workflows/${workflow.file}/dispatches`,
+    env,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        ref: BRANCH
+      })
+    }
+  );
+
+  await env.HEARTBEAT_KV.put(
+    key,
+    String(Date.now()),
+    { expirationTtl: 86400 }
+  );
+
+  return {
+    dispatched: true,
+    reason: "GitHub accepted recovery dispatch"
+  };
+}
+
+// --------------------------------------------------
+// MAIN HEARTBEAT
+// --------------------------------------------------
+
+async function runHeartbeat(env) {
+  const report = {
+    version: VERSION,
+    checkedAt: new Date().toISOString(),
+    repository: REPO,
+    workflows: [],
+    stages: [],
+    errors: []
+  };
+
+  // Monitor collection and watchdog.
+  for (const workflow of WORKFLOWS) {
+    try {
+      const status = await inspectWorkflow(workflow, env);
+
+      let action;
+
+      if (status.activeRuns > 0) {
+        action = {
+          dispatched: false,
+          reason: "Active run already exists"
+        };
+      } else if (status.stale) {
+        action = await dispatchBasicWorkflow(workflow, env);
+      } else {
+        action = {
+          dispatched: false,
+          reason: "Recent successful run detected"
+        };
+      }
+
+      report.workflows.push({
+        ...status,
+        action
+      });
+
+    } catch (error) {
+      report.errors.push({
+        workflow: workflow.name,
+        message: error.message
+      });
+    }
+  }
+
+  // Monitor evidence processing and article scheduling.
+  for (const stage of STAGES) {
+    try {
+      const result = await inspectStage(stage, env);
+      report.stages.push(result);
+
+    } catch (error) {
+      report.errors.push({
+        workflow: stage.name,
+        message: error.message
+      });
+    }
+  }
+
+  report.result = report.errors.length
+    ? "completed_with_errors"
+    : "completed";
+
+  await env.HEARTBEAT_KV.put(
+    "latest-heartbeat",
+    JSON.stringify(report),
+    { expirationTtl: 604800 }
+  );
+
+  console.log(JSON.stringify(report));
+
+  return report;
+}
+
+// --------------------------------------------------
+// CLOUDFLARE HANDLERS
+// --------------------------------------------------
+
+export default {
+  async scheduled(controller, env, ctx) {
+    ctx.waitUntil(runHeartbeat(env));
+  },
+
+  async fetch(request, env) {
+    const url = new URL(request.url);
+
+    if (url.pathname === "/" || url.pathname === "/health") {
+      let report = null;
+
+      try {
+        report = await env.HEARTBEAT_KV.get(
+          "latest-heartbeat",
+          "json"
+        );
+      } catch (error) {
+        return Response.json({
+          worker: "ChelseaFeeds External Heartbeat",
+          status: "online",
+          deployedVersion: VERSION,
+          storageError: error.message
+        }, { status: 500 });
+      }
+
+      return Response.json({
+        worker: "ChelseaFeeds External Heartbeat",
+        status: "online",
+        deployedVersion: VERSION,
+        latestHeartbeat: report
+      }, {
+        headers: {
+          "Cache-Control": "no-store"
+        }
+      });
+    }
+
+    return new Response("Not found", { status: 404 });
+  }
+};
