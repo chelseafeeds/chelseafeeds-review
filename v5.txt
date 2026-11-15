@@ -301,7 +301,9 @@ function findRelatedDownstreamRuns(downstreamRuns, upstreamRun) {
   });
 
   return {
-    identifiable: ambiguousRuns.length === 0,
+    // The source run itself is identifiable; ambiguousRuns separately
+    // determines whether dispatch is safe.
+    identifiable: true,
     exactMatch: null,
     ambiguousRuns: sortNewest(ambiguousRuns),
     reason: ambiguousRuns.length > 0
